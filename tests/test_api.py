@@ -266,7 +266,9 @@ def test_pick_port_skips_busy_port():
     from lexis_local.main import _pick_port
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
-        held.bind(("0.0.0.0", 0))  # noqa: S104 -- ephemeral test port, same wildcard the picker probes
+        held.bind(
+            ("0.0.0.0", 0)  # noqa: S104 -- ephemeral test port, same wildcard the picker probes
+        )
         busy = held.getsockname()[1]
         picked = _pick_port(busy, tries=5)
         assert picked != busy and picked > busy

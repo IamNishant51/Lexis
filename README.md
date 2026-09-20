@@ -119,7 +119,7 @@ HTTP surface:
 | `POST /v1/guard` | Direct validation: `{output, schema}` to `{valid, data\|errors}` |
 
 Engine tuning variables: `LEXIS_MODEL_PATH`, `LEXIS_MODEL_DIR`, `LEXIS_N_CTX`
-(default 4096), `LEXIS_N_THREADS`, `LEXIS_N_GPU_LAYERS` (`-1`: full GPU
+(default 8192; raise for huge agent prompts, lower for tight RAM), `LEXIS_N_THREADS`, `LEXIS_N_GPU_LAYERS` (`-1`: full GPU
 offload), `LEXIS_USE_PYTHON_MASK`. Server port: `PORT` (default 8000).
 
 ## 3. Latency and comparison

@@ -270,7 +270,7 @@ def opencode_json(base_url: str = LEXIS_BASE_URL) -> str:
                     "models": {
                         LEXIS_MODEL: {
                             "name": "Lexis (zero-hallucination)",
-                            "limit": {"context": 4096, "output": 512},
+                            "limit": {"context": 8192, "output": 512},
                         }
                     },
                 }

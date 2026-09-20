@@ -785,7 +785,10 @@ class StructuredEngine(Generic[T]):
         verbose: bool = False,
     ) -> None:
         self.model_path = resolve_model_path(model_path)
-        self.n_ctx = n_ctx if n_ctx is not None else _env_int("LEXIS_N_CTX", 4096)
+        # 8192 default: agentic clients (system prompt + tools + history)
+        # routinely exceed 4k-token windows; Qwen2.5 supports far larger.
+        # Override down (RAM) or up via LEXIS_N_CTX.
+        self.n_ctx = n_ctx if n_ctx is not None else _env_int("LEXIS_N_CTX", 8192)
         self.n_threads = n_threads if n_threads is not None else _env_int("LEXIS_N_THREADS", -1)
         if n_gpu_layers is not None:
             self.n_gpu_layers = n_gpu_layers
@@ -911,6 +914,30 @@ class StructuredEngine(Generic[T]):
         out = self._llm.create_completion(prompt, **create_kwargs)
         return out["choices"][0]["text"]
 
+    def _truncate_to_fit(self, text: str, max_tokens: int) -> str:
+        """Shrink an overlong prompt to the context budget, keeping the tail.
+
+        Agentic clients routinely exceed small n_ctx windows; llama.cpp
+        rejects those requests outright. The tail preserves the user query
+        and current turn, which dominate answer quality. Returns the
+        original text if tokenization itself fails.
+        """
+        if self._llm is None:
+            return text
+        budget = max(512, self.n_ctx - max_tokens - 256)
+        try:
+            ids = list(self._llm.tokenize(text.encode("utf-8", errors="ignore")))
+        except Exception as e:
+            log.debug("truncate skipped (tokenize failed: %s)", e)
+            return text
+        if len(ids) <= budget:
+            return text
+        try:
+            return bytes(self._llm.detokenize(ids[-budget:])).decode("utf-8", "ignore")
+        except Exception as e:
+            log.debug("truncate skipped (detokenize failed: %s)", e)
+            return text
+
     def _local_generate(self, prompt: str, follower: SchemaFollower, max_tokens: int) -> str:
         self.load()
         if self._llm is None:
@@ -926,7 +953,17 @@ class StructuredEngine(Generic[T]):
         chat_prompt = build_chatml_prompt(prompt)
 
         def attempt(instruction: str) -> str:
-            raw = self._complete(chat_prompt + instruction, grammar, max_tokens, follower)
+            full = chat_prompt + instruction
+            try:
+                raw = self._complete(full, grammar, max_tokens, follower)
+            except Exception as e:
+                if "exceed context window" not in str(e).lower():
+                    raise
+                short = self._truncate_to_fit(full, max_tokens)
+                if short == full:
+                    raise
+                log.warning("prompt exceeded context window; retrying truncated")
+                raw = self._complete(short, grammar, max_tokens, follower)
             return strip_to_json(raw)
 
         # Attempt 1: direct constrained decode. Attempt 2: repair retry that
