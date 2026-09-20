@@ -63,6 +63,8 @@ class ClassifyRequest(BaseModel):
 class ChatMessage(BaseModel):
     role: str = "user"
     content: Any = ""
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_id: str | None = None
 
 
 class ResponseFormat(BaseModel):
@@ -79,6 +81,8 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int = 512
     temperature: float = 0.0
     stream: bool = False
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any = None
 
 
 class CompletionRequest(BaseModel):
@@ -182,11 +186,26 @@ def _prompt_text(req: ChatCompletionRequest | CompletionRequest) -> str:
         parts = []
         for i, m in enumerate(req.messages):
             c = m.content if isinstance(m.content, str) else json.dumps(m.content)
+            
             # Statically truncate massive initial prompts (like AGENTS.md)
-            # so the prefix remains identical across requests, enabling sub-100ms caching!
             if (m.role == "system" or i == 0) and len(c) > 16000:
                 c = c[:8000] + "\n\n...[truncated to preserve cache]...\n\n" + c[-4000:]
-            parts.append(f"<|im_start|>{m.role}\n{c}<|im_end|>")
+                
+            # Format system prompt with tools if present (AFTER truncation!)
+            if (m.role == "system" or i == 0) and req.tools:
+                tools_str = "\n".join([json.dumps(t) for t in req.tools])
+                tools_prompt = f"\n\n# Tools\n\nYou are a tool-using AI. You MUST call one or more functions to assist with the user query.\nCRITICAL: DO NOT WRITE COMMANDS OR CODE TO BE EXECUTED AS PLAIN TEXT! YOU MUST USE THE <tool_call> XML TAGS TO EXECUTE THEM!\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{tools_str}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{{\"name\": <function-name>, \"arguments\": <args-json-object>}}\n</tool_call>\n\nExample:\n<tool_call>\n{{\"name\": \"execute_command\", \"arguments\": {{\"command\": \"ls -la\"}}}}\n</tool_call>"
+                c += tools_prompt
+                
+            if m.role == "tool":
+                parts.append(f"<|im_start|>user\n<tool_response>\n{c}\n</tool_response><|im_end|>")
+            elif m.role == "assistant" and m.tool_calls:
+                tcs = "".join([f"\n<tool_call>\n{{\"name\": \"{tc['function']['name']}\", \"arguments\": {tc['function']['arguments']}}}\n</tool_call>" for tc in m.tool_calls])
+                content_part = f"\n{c}" if c else ""
+                parts.append(f"<|im_start|>assistant{content_part}{tcs}<|im_end|>")
+            else:
+                parts.append(f"<|im_start|>{m.role}\n{c}<|im_end|>")
+                
         parts.append("<|im_start|>assistant\n")
         return "\n".join(parts)
     return req.prompt
@@ -196,6 +215,37 @@ def _openai_envelope(
     model: str, content_json: str, *, latency_ms: float, mode: str, confidence: float = 0.0
 ) -> dict[str, Any]:
     now = int(time.time())
+    
+    tcs = None
+    content = content_json
+    # Attempt to parse <tool_call> tags if content isn't JSON-stringified JSON (which would be escaped)
+    import re
+    if "<tool_call>" in content and not content.startswith('{"'):
+        parsed_tcs = []
+        matches = re.finditer(r"<tool_call>\s*({.*?})\s*</tool_call>", content, re.DOTALL)
+        for i, m in enumerate(matches):
+            try:
+                call_data = json.loads(m.group(1))
+                parsed_tcs.append({
+                    "id": f"call_{i}_{uuid.uuid4().hex[:6]}",
+                    "type": "function",
+                    "function": {
+                        "name": call_data["name"],
+                        "arguments": json.dumps(call_data["arguments"])
+                    }
+                })
+            except:
+                pass
+        if parsed_tcs:
+            tcs = parsed_tcs
+            content = re.sub(r"<tool_call>\s*{.*?}\s*</tool_call>", "", content, flags=re.DOTALL).strip()
+            if not content:
+                content = None
+                
+    message: dict[str, Any] = {"role": "assistant", "content": content}
+    if tcs:
+        message["tool_calls"] = tcs
+
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
         "object": "chat.completion",
@@ -204,12 +254,21 @@ def _openai_envelope(
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": content_json},
-                "finish_reason": "stop",
+                "message": message,
+                "finish_reason": "tool_calls" if tcs else "stop",
             }
         ],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        "lexis": {"mode": mode, "latency_ms": round(latency_ms, 2), "confidence": confidence, "hallucination_rate": 0.0},
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        },
+        "lexis": {
+            "latency_ms": round(latency_ms, 2),
+            "mode": mode,
+            "confidence": round(confidence, 4),
+            "hallucination_rate": 0.0,
+        },
     }
 
 
@@ -296,12 +355,57 @@ def chat_completions(req: ChatCompletionRequest, authorization: str | None = Hea
             )
 
         def _sse():
-            # Spec-shaped stream: role first, content in slices (some clients
-            # misbehave on a single giant delta), terminal stop chunk, DONE.
+            import re
+            tcs = None
+            text = content
+            if "<tool_call>" in text and not text.startswith('{"'):
+                parsed_tcs = []
+                matches = re.finditer(r"<tool_call>\s*({.*?})\s*</tool_call>", text, re.DOTALL)
+                for i, m in enumerate(matches):
+                    try:
+                        call_data = json.loads(m.group(1))
+                        parsed_tcs.append({
+                            "index": i,
+                            "id": f"call_{i}_{uuid.uuid4().hex[:6]}",
+                            "type": "function",
+                            "function": {
+                                "name": call_data["name"],
+                                "arguments": json.dumps(call_data["arguments"])
+                            }
+                        })
+                    except:
+                        pass
+                if parsed_tcs:
+                    tcs = parsed_tcs
+                    text = re.sub(r"<tool_call>\s*{.*?}\s*</tool_call>", "", text, flags=re.DOTALL).strip()
+            
             yield _chunk({"role": "assistant"}, None)
-            for i in range(0, len(content), 200):
-                yield _chunk({"content": content[i : i + 200]}, None)
-            yield _chunk({}, "stop")
+            
+            if text:
+                for i in range(0, len(text), 200):
+                    yield _chunk({"content": text[i : i + 200]}, None)
+                    
+            if tcs:
+                for tc in tcs:
+                    yield _chunk({
+                        "tool_calls": [{
+                            "index": tc["index"],
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {"name": tc["function"]["name"], "arguments": ""}
+                        }]
+                    }, None)
+                    
+                    args = tc["function"]["arguments"]
+                    for i in range(0, len(args), 50):
+                        yield _chunk({
+                            "tool_calls": [{
+                                "index": tc["index"],
+                                "function": {"arguments": args[i : i + 50]}
+                            }]
+                        }, None)
+                        
+            yield _chunk({}, "tool_calls" if tcs else "stop")
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(
