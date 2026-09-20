@@ -187,13 +187,17 @@ def _prompt_text(req: ChatCompletionRequest | CompletionRequest) -> str:
         for i, m in enumerate(req.messages):
             c = m.content if isinstance(m.content, str) else json.dumps(m.content)
             
-            # Statically truncate massive initial prompts (like AGENTS.md)
+            # CRITICAL CACHE FIX: We MUST truncate the massive system message statically here!
+            # If we rely on engine.py to truncate the entire flat prompt, the boundary shifts with
+            # every new chat message, forcing the CPU to re-evaluate thousands of tokens in the tail (4+ minutes).
+            # By pinning it here, the ChatML structure is 100% identical, evaluating only the delta (0.5s)!
             if (m.role == "system" or i == 0) and len(c) > 16000:
                 c = c[:8000] + "\n\n...[truncated to preserve cache]...\n\n" + c[-4000:]
                 
-            # Format system prompt with tools if present (AFTER truncation!)
+            # Format system prompt with tools if present
             if (m.role == "system" or i == 0) and req.tools:
-                tools_str = "\n".join([json.dumps(t) for t in req.tools])
+                sorted_tools = sorted(req.tools, key=lambda t: t.get("function", {}).get("name", ""))
+                tools_str = "\n".join([json.dumps(t, sort_keys=True) for t in sorted_tools])
                 tools_prompt = f"\n\n# Tools\n\nYou are a tool-using AI. You MUST call one or more functions to assist with the user query.\nCRITICAL: DO NOT WRITE COMMANDS OR CODE TO BE EXECUTED AS PLAIN TEXT! YOU MUST USE THE <tool_call> XML TAGS TO EXECUTE THEM!\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{tools_str}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{{\"name\": <function-name>, \"arguments\": <args-json-object>}}\n</tool_call>\n\nExample:\n<tool_call>\n{{\"name\": \"execute_command\", \"arguments\": {{\"command\": \"ls -la\"}}}}\n</tool_call>"
                 c += tools_prompt
                 

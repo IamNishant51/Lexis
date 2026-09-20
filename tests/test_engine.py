@@ -133,7 +133,7 @@ def test_truncate_to_fit_keeps_tail():
     eng = StructuredEngine(model_path="/nonexistent/model.gguf")
     eng._llm = _CharLlm()
     eng.n_ctx = 1000
-    text = "HEAD-" + "A" * 200 + "MIDDLE-" + "z" * 600 + "-TAIL"
+    text = "HEAD-" + "A" * 500 + "MIDDLE-" + "z" * 600 + "-TAIL"
     short = eng._truncate_to_fit(text, max_tokens=10)
     assert "HEAD-" in short
     assert "-TAIL" in short
