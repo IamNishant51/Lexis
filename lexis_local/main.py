@@ -53,6 +53,13 @@ app.add_middleware(
 # ------------------------------------------------------------------ models
 
 
+class ClassifyRequest(BaseModel):
+    text: str
+    classes: list[str]
+    model: str = "lexis-local"
+    max_tokens: int = 128
+
+
 class ChatMessage(BaseModel):
     role: str = "user"
     content: Any = ""
@@ -173,15 +180,20 @@ def _target_model(req: ChatCompletionRequest | CompletionRequest) -> type[BaseMo
 def _prompt_text(req: ChatCompletionRequest | CompletionRequest) -> str:
     if isinstance(req, ChatCompletionRequest):
         parts = []
-        for m in req.messages:
+        for i, m in enumerate(req.messages):
             c = m.content if isinstance(m.content, str) else json.dumps(m.content)
-            parts.append(f"{m.role}: {c}")
-        return "\n".join(parts) or "(empty prompt)"
+            # Statically truncate massive initial prompts (like AGENTS.md)
+            # so the prefix remains identical across requests, enabling sub-100ms caching!
+            if (m.role == "system" or i == 0) and len(c) > 16000:
+                c = c[:8000] + "\n\n...[truncated to preserve cache]...\n\n" + c[-4000:]
+            parts.append(f"<|im_start|>{m.role}\n{c}<|im_end|>")
+        parts.append("<|im_start|>assistant\n")
+        return "\n".join(parts)
     return req.prompt
 
 
 def _openai_envelope(
-    model: str, content_json: str, *, latency_ms: float, mode: str
+    model: str, content_json: str, *, latency_ms: float, mode: str, confidence: float = 0.0
 ) -> dict[str, Any]:
     now = int(time.time())
     return {
@@ -197,7 +209,7 @@ def _openai_envelope(
             }
         ],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        "lexis": {"mode": mode, "latency_ms": round(latency_ms, 2), "hallucination_rate": 0.0},
+        "lexis": {"mode": mode, "latency_ms": round(latency_ms, 2), "confidence": confidence, "hallucination_rate": 0.0},
     }
 
 
@@ -241,21 +253,30 @@ def chat_completions(req: ChatCompletionRequest, authorization: str | None = Hea
         latency = (time.perf_counter() - t0) * 1000
         return JSONResponse(
             _openai_envelope(
-                req.model, json.dumps({"results": docs}), latency_ms=latency, mode=eng.mode
+                req.model, json.dumps({"results": docs}), latency_ms=latency, mode=eng.mode, confidence=eng.last_confidence
             )
         )
 
     target = _target_model(req)
     prompt = _prompt_text(req)
+    rf = req.response_format
+    # Raw free text unless the caller explicitly asked for structured JSON.
+    # (json_object keeps the JSON path: it contracts to *some* valid object.)
+    schema_requested = req.lexis_schema is not None or (
+        rf is not None and rf.type in ("json_schema", "json_object")
+    )
     try:
-        obj = eng.generate(prompt, target, max_tokens=max_tokens)
+        if schema_requested:
+            obj = eng.generate(prompt, target, max_tokens=max_tokens)
+            content = obj.model_dump_json()
+        else:
+            content = eng.generate_text(prompt, max_tokens=max_tokens)
     except StructuredGenerationError as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
-    content = obj.model_dump_json()
     latency = (time.perf_counter() - t0) * 1000
 
     if req.stream:
-        payload = _openai_envelope(req.model, content, latency_ms=latency, mode=eng.mode)
+        payload = _openai_envelope(req.model, content, latency_ms=latency, mode=eng.mode, confidence=eng.last_confidence)
         chunk_id = payload["id"]
         created = payload["created"]
 
@@ -286,9 +307,36 @@ def chat_completions(req: ChatCompletionRequest, authorization: str | None = Hea
         return StreamingResponse(
             _sse(), media_type="text/event-stream", headers={"X-Lexis-Mode": eng.mode}
         )
-    resp = JSONResponse(_openai_envelope(req.model, content, latency_ms=latency, mode=eng.mode))
+    resp = JSONResponse(_openai_envelope(req.model, content, latency_ms=latency, mode=eng.mode, confidence=eng.last_confidence))
     resp.headers["X-Lexis-Mode"] = eng.mode
     return resp
+
+
+@app.post("/v1/classify")
+def classify(req: ClassifyRequest, authorization: str | None = Header(default=None)):
+    eng = get_engine()
+    t0 = time.perf_counter()
+    
+    import typing
+    from pydantic import create_model
+    enum_type = typing.Literal[tuple(req.classes)]  # type: ignore
+    model = create_model("ClassifySchema", classification=(enum_type, ...))
+    
+    try:
+        obj = eng.generate(req.text, model, max_tokens=req.max_tokens)
+        decision = getattr(obj, "classification")
+    except StructuredGenerationError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+        
+    latency = (time.perf_counter() - t0) * 1000
+    
+    return JSONResponse({
+        "object": "classification",
+        "model": req.model,
+        "classification": decision,
+        "confidence": eng.last_confidence,
+        "lexis": {"mode": eng.mode, "latency_ms": round(latency, 2)}
+    }, headers={"X-Lexis-Mode": eng.mode})
 
 
 @app.post("/v1/completions")

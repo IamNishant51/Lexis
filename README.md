@@ -1,11 +1,26 @@
-# Lexis
+# Lexis Local
 
-Local grammar-constrained structured generation. Pydantic schemas compiled to
-decoding grammars; structurally invalid tokens assigned zero probability before
-sampling. OpenAI-compatible HTTP interface. MIT license.
+<p align="left">
+  <img src="https://img.shields.io/badge/Python-3.10+-blue?style=flat-square&logo=python&logoColor=white" alt="Python" />
+  <img src="https://img.shields.io/badge/FastAPI-005571?style=flat-square&logo=fastapi&logoColor=white" alt="FastAPI" />
+  <img src="https://img.shields.io/badge/Llama.cpp-Engine-black?style=flat-square" alt="Llama.cpp" />
+  <img src="https://img.shields.io/badge/Pydantic-Validation-e92063?style=flat-square" alt="Pydantic" />
+  <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License" />
+</p>
 
-Requirements: Python >= 3.10. Optional: C++ toolchain for `llama-cpp-python`
-(CPU/MPS/CUDA); Qwen2.5-3B-Instruct Q4_K_M (~2 GB, downloaded once).
+**Local grammar-constrained structured generation.** Pydantic schemas compiled to decoding grammars; structurally invalid tokens assigned zero probability before sampling. OpenAI-compatible HTTP interface.
+
+## Supported Integrations
+
+Lexis acts as a drop-in, zero-hallucination structured backend for modern AI engineering tools.
+
+<p align="left">
+  <img src="https://img.shields.io/badge/OpenCode-000000?style=for-the-badge" alt="OpenCode" />
+  <img src="https://img.shields.io/badge/Aider-1a202c?style=for-the-badge&logo=terminal&logoColor=white" alt="Aider" />
+  <img src="https://img.shields.io/badge/Continue.dev-232323?style=for-the-badge&logo=visualstudiocode&logoColor=white" alt="Continue" />
+  <img src="https://img.shields.io/badge/AutoGen-0078D4?style=for-the-badge&logo=microsoft&logoColor=white" alt="AutoGen" />
+  <img src="https://img.shields.io/badge/OpenAI_SDK-412991?style=for-the-badge&logo=openai&logoColor=white" alt="OpenAI API" />
+</p>
 
 ## 1. Problem and solution
 
