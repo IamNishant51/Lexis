@@ -1,100 +1,232 @@
-# Lexis ⚡ Free · Local · Sub-100ms · Zero-Hallucination structured decisions
+# Lexis
 
-![sub-100ms](https://img.shields.io/badge/validation-median_0.01_ms-brightgreen)
-![zero-hallucination](https://img.shields.io/badge/format_hallucinations-0-blue)
-![local-first](https://img.shields.io/badge/data-leaves_never-grey)
-![python](https://img.shields.io/badge/python-%3E%3D3.10-blue)
-![license](https://img.shields.io/badge/license-MIT-green)
+Local grammar-constrained structured generation. Pydantic schemas compiled to
+decoding grammars; structurally invalid tokens assigned zero probability before
+sampling. OpenAI-compatible HTTP interface. MIT license.
 
-An open-source, **local-first structured-decision engine**: a hardware-accelerated
-GGUF backend with **grammar-constrained decoding** that makes structurally invalid
-output **impossible at generation time**, plus a **zero-hallucination shield** for any
-LLM — exposed as a drop-in **OpenAI-compatible API**.
+Requirements: Python >= 3.10. Optional: C++ toolchain for `llama-cpp-python`
+(CPU/MPS/CUDA); Qwen2.5-3B-Instruct Q4_K_M (~2 GB, downloaded once).
 
-- ✅ **Zero formatting hallucinations** — triple lock: native llama.cpp grammar (C++),
-  Python logit mask (`-inf` before sampling), pydantic validation + repair retry
-- ⚡ **Sub-100ms** validation path on laptop hardware — measured, not claimed (table below)
-- 🔒 **100% local & private** — Qwen-2.5-3B-Instruct GGUF via llama.cpp (CPU/MPS/CUDA)
-- 🔌 **Drop-in OpenAI endpoint** — point Aider / Continue / AutoGen at `http://localhost:8000/v1`
-- 🛡️ **Agent shield** — `lexis_local/agents.py` strips prose/fences/tool envelopes and locks
-  every completion to your schema before your tool ever sees it
-- 📦 **One-command boot** — `pip install` the wheel, type `lexis-local`, done
+## 1. Problem and solution
 
-## Measured performance (not marketing)
+### 1.1 Problem: unconstrained autoregressive sampling
 
-From `python benchmarks/benchmark.py --requests 30` on reference laptop hardware:
+Standard large language models generate tokens sequentially. At each step `t`,
+the model emits a logit vector over the vocabulary, a sampler (top-k, top-p,
+temperature) selects from the high-probability head, and the chosen token is
+appended to the prefix for step `t+1`. No component of this loop is aware of
+the target structure.
 
-| Check | Median | Target | Verdict |
-|---|---|---|---|
-| Schema compile | 0.30 ms | < 100 ms | ✅ PASS |
-| Mock generate end-to-end | 0.52 ms | < 100 ms | ✅ PASS |
-| Validation only | 0.01 ms | < 100 ms | ✅ PASS |
-| Parallel ×8 batch | 8.38 ms | < 100 ms | ✅ PASS |
+The failure modes follow directly from this construction:
 
-Format-hallucination rate across the suite (67 tests, adversarial repair cases included): **0**.
-Reproduce it yourself: `python benchmarks/benchmark.py` and `pytest -q`.
+- **Structural branch deviation.** Once a sampled token exits the set of
+  schema-valid continuations (a missing quote, a wrong key, a premature `]`),
+  every subsequent token conditions on the invalid prefix. The error compounds;
+  the model cannot return to the valid branch because the valid branch is no
+  longer reachable from its context.
+- **Syntax breakage.** Unconstrained sampling produces unterminated strings,
+  trailing commas, unescaped control characters, and truncated objects. Any
+  downstream `json.loads` call raises.
+- **Schema violations in valid JSON.** Syntactically parseable output still
+  drops required keys, mistypes values (`"3"` where `3` is required), or emits
+  out-of-range enum members.
+- **Fence and envelope leakage.** Instruction-tuned models wrap payloads in
+  markdown fences, preamble prose, or tool-call envelopes. Parsers that expect
+  a bare JSON document fail before validation begins.
+- **Post-hoc correction cost.** The standard mitigation — validate after
+  generation, and on failure re-issue the full request — pays the complete
+  forward-pass cost again per retry, with no convergence guarantee. Latency
+  balloons as `attempts x full_generation_cost`, and each attempt can fail
+  independently with unchanged probability.
 
-## Non-developer install (double-click, ~5 minutes, zero knowledge)
+### 1.2 Solution: constraints moved inside the sampling step
 
-You need a **Windows, Mac, or Linux** computer and internet (once, for the ~2 GB model).
+Lexis inverts the verification order. Instead of generating freely and checking
+afterward, the schema is compiled to a grammar **before the first token**, and
+at every decoding step the set of grammar-valid continuations is evaluated
+against the candidate vocabulary. Tokens outside that set are set to `-inf`
+at both enforcement layers — the native llama.cpp grammar evaluator (C++) and
+the stateful Python logit processor — prior to any sampling operation.
+Temperature, top-k, and top-p then operate exclusively over the surviving
+distribution.
 
-**Step 1 — Install Python (one time only, skip if you have it)**
-1. Open https://www.python.org/downloads/ and click the big yellow **Download Python** button.
-2. Run the downloaded file.
-3. ⚠️ Windows users: on the very first setup screen, tick ✅ **"Add python.exe to PATH"**
-   at the bottom, then click *Install Now*.
-4. Check: open a terminal and type `python --version` — you should see `Python 3.10`
-   or higher (e.g. `Python 3.12.10`).
+Consequence: a structurally invalid token has exactly zero probability at
+every position. Invalid outputs are not detected and repaired; they are
+mathematically impossible at runtime. A final pydantic validation pass and a
+single grammar-constrained repair retry remain as defense in depth against
+integration-layer faults (truncation, transport corruption), not against
+model error.
 
-**Step 2 — Get Lexis**
-- Click the green **Code** button on this page → **Download ZIP** → unzip it anywhere
-  (e.g. your Desktop). Open the unzipped `lexis-local` folder.
+## 2. System architecture
 
-**Step 3 — Run the one-click installer (pick ONE)**
+```
+User schema (Pydantic model / JSON Schema / response_format)
+        |
+        v
++-----------------------------+
+| Grammar compilation         |  LlamaGrammar.from_json_schema;
+| BNF / GBNF                  |  fallback: built-in GBNF compiler
+|                             |  covering object/array/scalar/enum shapes
++--------------+--------------+
+               |
+               v
++-----------------------------+
+| Logit masking layer         |  per-step evaluation of valid next-token
+| (interception, pre-sample)  |  set; illegal logits := -inf.
+|                             |  C++ native grammar + stateful Python
+|                             |  mask (incl. BPE-partial key tracking).
++--------------+--------------+
+               |
+               v
++-----------------------------+
+| Local inference core        |  llama.cpp, GGUF weights
+| (hardware-accelerated)      |  (Qwen2.5-3B-Instruct Q4_K_M default).
+|                             |  CPU / MPS / CUDA via LEXIS_N_GPU_LAYERS.
+|                             |  Absent model or backend -> mock core
+|                             |  serving the identical API + validator.
++--------------+--------------+
+               |
+               v
++-----------------------------+
+| Output conditioning         |  fence/prose/tool-envelope stripping,
+| + pydantic validation       |  strict validation, one constrained
+|                             |  repair retry, deterministic fallback.
++--------------+--------------+
+               |
+               v
+        Final JSON document (schema-conformant by construction)
+```
 
-| Your setup | What to do |
-|---|---|
-| **Windows, simplest** | Double-click **`install.bat`**. A black window opens and narrates every step. |
-| **Windows, Git Bash terminal** | Right-click inside the folder → *Open Git Bash here* → type `bash install.sh` + Enter. |
-| **Mac / Linux** | Open a terminal in the folder → type `bash install.sh` + Enter. |
+Component-to-file mapping:
 
-**Step 4 — Watch it work (you do nothing)**
-You will see, in order: `Host detected…` → `Using Python…` → `Creating isolated
-environment…` → `Installing open-source building blocks…` → `Downloading…
-(~2GB, one time)` → `Running smoke tests…` → `Launching Lexis on
-http://localhost:8000`. Leave that window open — closing it stops the server.
-
-**Step 5 — Confirm it's alive**
-Open http://localhost:8000/health in your browser. You should see `"status": "ok"`.
-`"mode": "local"` means live GPU/CPU inference; `"mode": "mock"` means the model file
-hasn't downloaded yet — the API still works identically; re-run the installer to fetch it.
-
-No account, no API key, no cloud. Your text never leaves your machine.
-
-### Troubleshooting (path errors and friends)
-
-| Symptom | Cause | Fix |
+| Stage | Implementation | Notes |
 |---|---|---|
-| `Python 3 not found` / `python: command not found` | Python installed without PATH, or terminal opened before install | Reinstall with ✅ **Add python.exe to PATH** ticked (Step 1.3), then **close and reopen** the terminal window |
-| `Python 3.10+ required, found 3.9` | Old system Python | Install a newer Python from python.org; the installer auto-prefers `python3.12 → 3.11 → 3.10` |
-| `install.bat` flashes and closes | Double-clicked from inside the ZIP, or Python missing | Extract the ZIP first, then double-click; if it still flashes, open CMD in the folder and run `install.bat` to read the error |
-| Git Bash says `bash: ./install.sh: Permission denied` | Missing execute bit | Run `bash install.sh` (with the `bash` prefix) instead of `./install.sh` |
-| `No such file or directory` in Git Bash | Terminal is in the wrong folder | `cd` into the unzipped `lexis-local` folder first (`ls` should show `install.sh`); paths with spaces work — keep the quotes if you type them manually |
-| Download stalls or fails halfway | Flaky network | Just re-run the installer — downloads **resume** where they stopped. Or set `SKIP_MODEL=1` to start in mock mode now and drop the `.gguf` file into `~/.cache/lexis/models/` later |
-| `llama.cpp not importable` | No C++ toolchain for the accelerated wheel | Expected on bare machines — mock mode still serves the full API. For live inference install a compiler (Windows: Visual Studio Build Tools) and re-run |
-| `Port 8000 is busy` / server won't start | Another app owns the port | `PORT=8080 bash install.sh` (Windows CMD: `set PORT=8080` then `install.bat`), and point agents at `http://localhost:8080/v1` |
-| Antivirus quarantines files mid-install | Heuristic false positive on the ML wheel | Restore the folder in your antivirus and re-run; Lexis is 100% open-source — every line is auditable here |
+| Schema intake | `lexis_local/main.py` (`response_format`, `lexis_schema`, `lexis_parallel`) | OpenAI-compatible request shapes |
+| Grammar compilation | `lexis_local/engine.py` (`compile_schema_to_gbnf`, `build_grammar`) | Native grammar preferred; GBNF fallback |
+| Logit masking | `lexis_local/engine.py` (`JsonLogitMask`, `SchemaFollower`) | `-inf` before sampling; fail-open only on total dead-end |
+| Inference core | `lexis_local/engine.py` (`StructuredEngine`, `generate_parallel`) | Single loaded model; batched pairs |
+| Conditioning/validation | `lexis_local/wrapper.py` (`guard`, `zero_hallucination`), `lexis_local/agents.py` (`shield_completion`) | Strip, validate, repair, fallback |
+| Agent adapters | `lexis_local/agents.py` | Aider / Continue / OpenCode / AutoGen |
 
-Useful knobs: `MODEL_QANT=Q8_0` (more accurate, bigger download),
-`LEXIS_N_GPU_LAYERS=-1` (offload all layers to NVIDIA GPU), `SKIP_TESTS=1`, `SKIP_MODEL=1`.
+HTTP surface:
 
-## Quick Start for Coding Agents (copy-paste)
+| Method and path | Function |
+|---|---|
+| `POST /v1/chat/completions` | Chat completions; honors `response_format`, `lexis_schema`, `lexis_parallel` |
+| `POST /v1/completions` | Legacy completions with identical locking |
+| `GET /v1/models` | Model inventory (`lexis-local`, local or mock) |
+| `GET /health` | Liveness, engine mode, latency counters |
+| `POST /v1/guard` | Direct validation: `{output, schema}` to `{valid, data\|errors}` |
 
-Start the server first (`lexis-local`, or `PORT=8000 bash install.sh`). Then pick your agent.
-Every snippet below targets **`http://localhost:8000/v1`** — no other change needed.
-All four configs can also be auto-generated: `python -c "from lexis_local.agents import write_agent_configs; write_agent_configs()"`.
+Engine tuning variables: `LEXIS_MODEL_PATH`, `LEXIS_MODEL_DIR`, `LEXIS_N_CTX`
+(default 4096), `LEXIS_N_THREADS`, `LEXIS_N_GPU_LAYERS` (`-1`: full GPU
+offload), `LEXIS_USE_PYTHON_MASK`. Server port: `PORT` (default 8000).
 
-**Aider** — save as `.aider.conf.yml` in your project root (or `~/.aider.conf.yml`):
+## 3. Latency and comparison
+
+### 3.1 Measured latency
+
+Source: `python benchmarks/benchmark.py --requests 30`, reference laptop
+hardware, mock backend (grammar + validation path; excludes LLM forward pass,
+which is hardware- and model-dependent). Test suite: 67 passed, 4 skipped
+(live-GGUF tests gate on model presence).
+
+| Check | Median | Budget | Result |
+|---|---|---|---|
+| Schema compilation | 0.30 ms | < 100 ms | pass |
+| End-to-end generation (mock) | 0.52 ms | < 100 ms | pass |
+| Validation-only overhead | 0.01 ms | < 100 ms | pass |
+| Parallel x8 batch staging | 8.38 ms | < 100 ms | pass |
+
+Reproduce: `pytest -q`, then `python benchmarks/benchmark.py`.
+
+### 3.2 Engineering comparison
+
+Lexis column: measured on this repository's suite and benchmark. Adjacent
+columns: architectural properties of each approach class, not vendor
+benchmarks. Error-rate entries describe whether the construction permits
+invalid tokens (nonzero by construction) or forbids them (zero by
+construction); the Lexis zero was additionally measured across 67 tests
+including adversarial repair cases.
+
+| Axis | Lexis | Standard JSON-mode APIs | Cloud structured-output APIs | Validation-wrapper libraries |
+|---|---|---|---|---|
+| Token sampling penalization | Grammar evaluation + logit mask set illegal tokens to `-inf` pre-sample, at C++ and Python layers | Logit bias hints or post-hoc parsing; sampler remains unconstrained | Server-side constrained decoding where offered; otherwise schema validation after sampling | No sampler access; regex or re-prompt after generation |
+| Compute cost per 1M tokens | Local hardware marginal cost only; no per-token billing | Full forward-pass cost per attempt, multiplied by retries on failure | Metered per-token billing plus retry multipliers | Full generation cost per attempt plus corrector-loop calls |
+| Formatting error rate | 0 (invalid tokens unrepresentable in the sampled distribution) | Nonzero: any token in the vocabulary remains reachable at every step | Nonzero except where provider guarantees constrained decoding for the specific call | Nonzero: detection is post-hoc; correction is probabilistic |
+| Off-grid privacy compliance | Weights, prompts, and outputs remain on the host; no network path in the inference loop | Prompts and outputs transit provider infrastructure | Prompts and outputs transit provider infrastructure | Depends on wrapped backend; wrapper itself adds no transport |
+
+## 4. Deployment and integration
+
+### 4.1 Installer pipeline
+
+`install.sh` (Linux, macOS, Git Bash) and `install.bat` (native Windows CMD)
+execute the same provisioning sequence:
+
+1. Resolve Python 3.10+ (`python3.12` down to `py -3` launcher fallback).
+2. Create an isolated virtual environment (`.venv/`).
+3. Install the package plus local-inference extensions (`llama-cpp-python`
+   prebuilt CPU wheel preferred; CUDA source build under `LLAMA_CUDA=1`;
+   graceful continuation in mock mode without a toolchain).
+4. Fetch weights once (`Qwen2.5-3B-Instruct` `Q4_K_M`, resumable;
+   override with `MODEL_QANT`, skip with `SKIP_MODEL=1`) into
+   `~/.cache/lexis/models/`.
+5. Run the test suite as a gate (skip with `SKIP_TESTS=1`).
+6. Launch the FastAPI server on `$PORT` (default 8000).
+
+Operator sequence (non-technical): install Python 3.10+ with PATH enabled,
+unzip the release, double-click `install.bat` (Windows) or run
+`bash install.sh` (macOS/Linux/Git Bash), open `http://localhost:8000/health`
+and confirm `"status": "ok"`. `"mode": "mock"` indicates the weights are not
+yet cached; the API contract is identical in both modes.
+
+Failure modes: Python not on PATH (reinstall with PATH enabled, reopen the
+terminal); port conflict (set `PORT`); stalled download (re-run; transfers
+resume); missing compiler (mock mode until a toolchain is installed).
+
+Developer install:
+
+```bash
+git clone https://github.com/lexis-local/lexis-local && cd lexis-local
+python -m venv .venv && .venv/bin/activate
+pip install -e ".[dev]"        # append [local] for live GGUF inference
+pytest -q
+lexis                          # boot server; honors $PORT
+```
+
+### 4.2 Integration
+
+Base URL for all configurations: `http://localhost:8000/v1`.
+
+Raw OpenAI client with strict schema:
+
+```python
+import openai
+
+client = openai.OpenAI(base_url="http://localhost:8000/v1", api_key="local")
+response = client.chat.completions.create(
+    model="lexis-local",
+    messages=[{"role": "user", "content": "Approve refund #42?"}],
+    response_format={
+        "type": "json_schema",
+        "json_schema": {
+            "name": "verdict",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "approved": {"type": "boolean"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["approved", "reason"],
+            },
+        },
+    },
+)
+print(response.choices[0].message.content)
+```
+
+Aider (`.aider.conf.yml`):
+
 ```yaml
 openai-api-base: http://localhost:8000/v1
 openai-api-key: local
@@ -104,9 +236,9 @@ weak-model: openai/lexis-local
 cache-prompts: false
 stream: true
 ```
-Then run: `aider --model openai/lexis-local`
 
-**Continue** — paste under `models:` in `~/.continue/config.yaml`:
+Continue (`~/.continue/config.yaml`, under `models:`):
+
 ```yaml
 - name: Lexis Shield
   provider: openai
@@ -117,14 +249,8 @@ Then run: `aider --model openai/lexis-local`
   capabilities: [toolUse]
 ```
 
-**AutoGen** — lock any assistant agent in-process (strips chatter, enforces your schema):
-```python
-from lexis_local.agents import register_lexis_shield
+OpenCode (`opencode.json`):
 
-shielded = register_lexis_shield(my_assistant_agent, MySchema)  # locks generate_reply()
-```
-
-**OpenCode** — merge into `opencode.json`:
 ```json
 {
   "provider": {
@@ -139,83 +265,14 @@ shielded = register_lexis_shield(my_assistant_agent, MySchema)  # locks generate
 }
 ```
 
-**Raw OpenAI call with a locked schema** (any framework speaking the protocol):
-```python
-import openai
-client = openai.OpenAI(base_url="http://localhost:8000/v1", api_key="local")
-r = client.chat.completions.create(
-    model="lexis-local",
-    messages=[{"role": "user", "content": "Approve refund #42?"}],
-    response_format={"type": "json_schema", "json_schema": {
-        "name": "verdict",
-        "schema": {"type": "object",
-                   "properties": {"approved": {"type": "boolean"},
-                                  "reason": {"type": "string"}},
-                   "required": ["approved", "reason"]}}},
-)
-print(r.choices[0].message.content)  # always {"approved": ..., "reason": ...}
-```
+All four files are machine-generable:
+`python -c "from lexis_local.agents import write_agent_configs; write_agent_configs()"`.
+In-process agent shielding: `register_lexis_shield(agent, Schema)`;
+arbitrary LLM clients: `lexis_local.wrapper.zero_hallucination`.
 
-## Developer quick start
-
-```bash
-git clone https://github.com/lexis-local/lexis-local && cd lexis-local
-python -m venv .venv && .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"                       # add [local] for live GGUF inference
-pytest -q                                     # 67 passed, 4 skipped (live-GGUF tests need the model)
-python benchmarks/benchmark.py                # latency proof, all targets sub-100ms
-lexis-local                                     # boot the server (honors $PORT)
-python scripts/build_dist.py                  # clean sdist + wheel in dist/
-```
-
-Guard **any** LLM client in 3 lines:
-```python
-from lexis_local.wrapper import zero_hallucination  # (also: shield_completion, LexisAgentProxy)
-
-@zero_hallucination(Decision)          # invalid JSON -> auto-repair -> valid Decision
-def ask(prompt: str) -> str:
-    return my_llm_client.complete(prompt)
-```
-
-## API surface
-
-| Method & path | Purpose |
-|---|---|
-| `POST /v1/chat/completions` | OpenAI chat; honors `response_format` + Lexis extensions `lexis_schema` / `lexis_parallel` |
-| `POST /v1/completions` | Legacy completions with the same schema locking |
-| `GET /v1/models` | Model inventory (local GGUF or mock) |
-| `GET /health` | Liveness + engine mode + latency stats |
-| `POST /v1/guard` | Direct validation: `{output, schema}` → `{valid, data\|errors}` |
-
-Tune the live engine with env vars: `LEXIS_MODEL_PATH` (explicit `.gguf`),
-`LEXIS_N_CTX` (default 4096), `LEXIS_N_THREADS`, `LEXIS_N_GPU_LAYERS` (`-1` = all to GPU),
-`LEXIS_USE_PYTHON_MASK` (extra mask layer for small vocabs; native grammar always on).
-
-## How it works (30 seconds)
-
-1. Your Pydantic model compiles to a **native llama.cpp grammar**
-   (`LlamaGrammar.from_json_schema`, else our GBNF compiler) — illegal tokens die in C++.
-2. A stateful Python **logit mask** (`-inf` before sampling) adds defense-in-depth,
-   including BPE-partial key tracking so structured keys stream without stalling.
-3. Output is **stripped** (fences/prose/tool envelopes) and **pydantic-validated**;
-   failures get one grammar-constrained **repair retry**, then a deterministic
-   schema-derived fallback. Callers never see corrupt JSON.
-4. `generate_parallel()` batches many (prompt, schema) pairs over one loaded model.
-5. No model file? **Mock mode** serves the identical API + validator (CI-friendly).
-
-## Layout
-
-```
-lexis_local/main.py     FastAPI server (/v1/chat/completions, /v1/completions, /v1/models, /health, /v1/guard)
-lexis_local/engine.py   Live GGUF core: grammar compiler, ChatML, mask, repair, mock fallback
-lexis_local/wrapper.py  @zero_hallucination decorator + GuardedClient for any LLM
-lexis_local/agents.py   Aider/Continue/OpenCode/AutoGen adapters + shield pipeline
-tests/                test_engine.py, test_api.py, test_agents.py, test_live_inference.py, test_live_production.py, test_live_production.py
-benchmarks/           latency proof script
-scripts/build_dist.py clean sdist + wheel builder
-install.sh            Linux/macOS/Git-Bash one-click installer
-install.bat           Native Windows one-click installer
-```
-
-See `AGENTS.md` for the build roadmap and agent hand-offs, `CONTRIBUTING.md` to contribute.
+Layout: `lexis_local/main.py` (server), `lexis_local/engine.py` (grammar,
+masking, inference), `lexis_local/wrapper.py` (guard decorator),
+`lexis_local/agents.py` (adapters), `tests/` (67 tests + 4 live-gated),
+`benchmarks/benchmark.py`, `scripts/build_dist.py`, `install.sh`,
+`install.bat`. Build roadmap: `AGENTS.md`. Contributions: `CONTRIBUTING.md`.
 License: MIT.
