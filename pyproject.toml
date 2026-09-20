@@ -1,0 +1,98 @@
+[project]
+name = "lexis-local"
+version = "0.2.0"
+description = "Lexis: ultra-fast, local-first, zero-hallucination structured-decision engine + OpenAI-compatible API wrapper"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Lexis Contributors" }]
+maintainers = [{ name = "Lexis Contributors" }]
+keywords = ["llm", "structured-generation", "logit-masking", "json-schema", "local-first", "openai-compatible", "aider", "continue", "opencode"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+  "fastapi>=0.109",
+  "uvicorn[standard]>=0.27",
+  "pydantic>=2.6",
+  "jsonschema>=4.21",
+  "jsonref>=1.1",
+  "numpy>=1.26",
+  "httpx>=0.27",
+  "huggingface-hub>=0.21",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+local = [
+  "llama-cpp-python>=0.2.75",
+  "outlines>=0.0.28",
+]
+all = [
+  "llama-cpp-python>=0.2.75",
+  "outlines>=0.0.28",
+]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+  "pytest-cov>=5.0",
+  "httpx>=0.27",
+  "ruff>=0.3",
+  "black>=24.0",
+  "mypy>=1.9",
+  "build>=1.0",
+]
+bench = [
+  "rich>=13.7",
+  "psutil>=5.9",
+]
+
+[project.urls]
+Homepage = "https://github.com/lexis-local/lexis-local"
+Repository = "https://github.com/lexis-local/lexis-local"
+Issues = "https://github.com/lexis-local/lexis-local/issues"
+
+[project.scripts]
+lexis = "lexis_local.main:start_server"
+lexis-local = "lexis_local.main:start_server"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]  # assert is the standard test idiom
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+ignore_missing_imports = true
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lexis_local*"]
