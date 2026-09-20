@@ -316,9 +316,12 @@ def build_grammar(response_model: type[BaseModel]) -> tuple[Any, str]:
 # ---------------------------------------------------------------------------
 
 
-def build_chatml_prompt(user: str, system: str = JSON_ONLY_SYSTEM) -> str:
+def build_chatml_prompt(user: str, system: str | None = JSON_ONLY_SYSTEM) -> str:
+    if "<|im_start|>" in user:
+        return user
+    sys_part = CHATML_SYSTEM_FMT.format(content=system) if system else ""
     return (
-        CHATML_SYSTEM_FMT.format(content=system)
+        sys_part
         + CHATML_USER_FMT.format(content=user)
         + CHATML_ASSISTANT_PREFIX
     )
@@ -809,6 +812,7 @@ class StructuredEngine(Generic[T]):
         self._grammar_backend: str = "none"
         self.last_latency_ms: float = 0.0
         self.last_validation_ms: float = 0.0
+        self.last_confidence: float = 0.0
         self.last_backend: str = "mock"
         self.last_grammar: str = "none"
         self.last_repair_used: bool = False
@@ -822,7 +826,7 @@ class StructuredEngine(Generic[T]):
             if self._llm is not None or self._mock:
                 return
             try:
-                from llama_cpp import Llama  # type: ignore
+                from llama_cpp import Llama, LlamaRAMCache  # type: ignore
 
                 kwargs: dict[str, Any] = {
                     "model_path": str(self.model_path),
@@ -834,6 +838,7 @@ class StructuredEngine(Generic[T]):
                 if self.n_gpu_layers != 0:
                     kwargs["n_gpu_layers"] = self.n_gpu_layers
                 self._llm = Llama(**kwargs)
+                self._llm.set_cache(LlamaRAMCache(capacity_bytes=2 << 30))  # 2GB cache for JEV speeds
                 self._mock = False
                 # One-time backend capability probe.
                 _, self._grammar_backend = build_grammar(_ProbeModel)
@@ -900,7 +905,7 @@ class StructuredEngine(Generic[T]):
         grammar: Any,
         max_tokens: int,
         follower: SchemaFollower | None,
-    ) -> str:
+    ) -> tuple[str, float]:
         create_kwargs: dict[str, Any] = {
             "max_tokens": max_tokens,
             "temperature": 0.0,
@@ -912,31 +917,46 @@ class StructuredEngine(Generic[T]):
         if follower is not None and self._vocab_tokens:
             create_kwargs["logits_processor"] = [self._make_mask_processor(follower)]
         out = self._llm.create_completion(prompt, **create_kwargs)
-        return out["choices"][0]["text"]
+        
+        choice = out["choices"][0]
+        text = choice["text"]
+        
+        confidence = 0.0
+        if "logprobs" in choice and choice["logprobs"] and "token_logprobs" in choice["logprobs"]:
+            logprobs = choice["logprobs"]["token_logprobs"]
+            valid_logprobs = [lp for lp in logprobs if lp is not None]
+            if valid_logprobs:
+                import math
+                avg_logprob = sum(valid_logprobs) / len(valid_logprobs)
+                confidence = math.exp(avg_logprob)
+                
+        return text, confidence
 
     def _truncate_to_fit(self, text: str, max_tokens: int) -> str:
-        """Shrink an overlong prompt to the context budget, keeping the tail.
-
-        Agentic clients routinely exceed small n_ctx windows; llama.cpp
-        rejects those requests outright. The tail preserves the user query
-        and current turn, which dominate answer quality. Returns the
-        original text if tokenization itself fails.
-        """
+        """Shrink an overlong prompt by cutting out the middle to fit the budget."""
         if self._llm is None:
             return text
         budget = max(512, self.n_ctx - max_tokens - 256)
+        
         try:
             ids = list(self._llm.tokenize(text.encode("utf-8", errors="ignore")))
+            if len(ids) <= budget:
+                return text
+            
+            head_budget = budget // 4
+            tail_budget = budget - head_budget - 10
+            
+            head = bytes(self._llm.detokenize(ids[:head_budget])).decode("utf-8", "ignore")
+            tail = bytes(self._llm.detokenize(ids[-tail_budget:])).decode("utf-8", "ignore")
         except Exception as e:
-            log.debug("truncate skipped (tokenize failed: %s)", e)
-            return text
-        if len(ids) <= budget:
-            return text
-        try:
-            return bytes(self._llm.detokenize(ids[-budget:])).decode("utf-8", "ignore")
-        except Exception as e:
-            log.debug("truncate skipped (detokenize failed: %s)", e)
-            return text
+            # Fallback to character counts if tokenization fails
+            char_budget = budget * 4
+            if len(text) <= char_budget:
+                return text
+            head = text[:char_budget // 4]
+            tail = text[-(char_budget - (char_budget // 4)):]
+            
+        return head + "\n\n...[truncated]...\n\n" + tail
 
     def _local_generate(self, prompt: str, follower: SchemaFollower, max_tokens: int) -> str:
         self.load()
@@ -955,7 +975,7 @@ class StructuredEngine(Generic[T]):
         def attempt(instruction: str) -> str:
             full = chat_prompt + instruction
             try:
-                raw = self._complete(full, grammar, max_tokens, follower)
+                raw, conf = self._complete(full, grammar, max_tokens, follower)
             except Exception as e:
                 if "exceed context window" not in str(e).lower():
                     raise
@@ -963,7 +983,8 @@ class StructuredEngine(Generic[T]):
                 if short == full:
                     raise
                 log.warning("prompt exceeded context window; retrying truncated")
-                raw = self._complete(short, grammar, max_tokens, follower)
+                raw, conf = self._complete(short, grammar, max_tokens, follower)
+            self.last_confidence = conf
             return strip_to_json(raw)
 
         # Attempt 1: direct constrained decode. Attempt 2: repair retry that
@@ -1024,6 +1045,64 @@ class StructuredEngine(Generic[T]):
     ) -> str:
         return self.generate(prompt, response_model, max_tokens).model_dump_json()  # type: ignore[arg-type]
 
+    def generate_text(self, prompt: str, max_tokens: int = 512) -> str:
+        """Free-text decode for plain chat (no schema requested).
+
+        No grammar, no JSON envelope: the model answers in its own words
+        (markdown, code fences included). Used when the caller passes no
+        response_format / lexis_schema. Mock backend echoes the prompt.
+        """
+        t0 = time.perf_counter()
+        self.last_repair_used = False
+        
+        def _extract_mock_reply(p: str) -> str:
+            if "<|im_start|>user\n" in p:
+                parts = p.split("<|im_start|>user\n")
+                if len(parts) > 1:
+                    return parts[-1].replace("<|im_end|>", "").replace("<|im_start|>assistant\n", "").strip()
+            parts = p.split("\nuser: ")
+            if len(parts) > 1:
+                return parts[-1].strip()
+            return p.strip()[-50:] or "(empty prompt)"
+
+        if self._mock:
+            text = _extract_mock_reply(prompt)
+            self.last_backend = "mock"
+            self.last_grammar = "none"
+        else:
+            with self._lock:
+                try:
+                    self.load()
+                    if self._llm is None:
+                        raise StructuredGenerationError("local backend unavailable")
+                    
+                    full_prompt = build_chatml_prompt(prompt, system=None)
+                    try:
+                        raw, conf = self._complete(full_prompt, None, max_tokens, None)
+                    except Exception as e:
+                        if "exceed context window" not in str(e).lower():
+                            raise
+                        short_prompt = self._truncate_to_fit(full_prompt, max_tokens)
+                        if short_prompt == full_prompt:
+                            raise
+                        log.warning("prompt exceeded context window; retrying truncated in generate_text")
+                        raw, conf = self._complete(short_prompt, None, max_tokens, None)
+                        
+                    text = raw.strip()
+                    self.last_confidence = conf
+                    self.last_backend = "local"
+                    self.last_grammar = "none"
+                except Exception as e:
+                    import traceback
+                    err = traceback.format_exc()
+                    log.warning("local text decode failed: %s", err)
+                    text = f"INTERNAL ERROR: {e}\n\nTraceback:\n{err}"
+                    self.last_backend = "local+fallback"
+                    self.last_repair_used = True
+        self.last_latency_ms = (time.perf_counter() - t0) * 1000
+        self.last_validation_ms = 0.0
+        return text
+
     def generate_parallel(
         self,
         requests: list[tuple[str, Any]],
@@ -1057,6 +1136,7 @@ class StructuredEngine(Generic[T]):
             "last_repair_used": self.last_repair_used,
             "last_latency_ms": self.last_latency_ms,
             "last_validation_ms": self.last_validation_ms,
+            "last_confidence": self.last_confidence,
         }
 
 

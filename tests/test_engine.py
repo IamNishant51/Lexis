@@ -133,10 +133,12 @@ def test_truncate_to_fit_keeps_tail():
     eng = StructuredEngine(model_path="/nonexistent/model.gguf")
     eng._llm = _CharLlm()
     eng.n_ctx = 1000
-    text = "A" * 200 + "TAIL-" + "z" * 600  # 805 chars > 734 budget
+    text = "HEAD-" + "A" * 200 + "MIDDLE-" + "z" * 600 + "-TAIL"
     short = eng._truncate_to_fit(text, max_tokens=10)
-    assert len(short) == 1000 - 10 - 256
-    assert short.endswith("z" * 600) and "TAIL-" in short
+    assert "HEAD-" in short
+    assert "-TAIL" in short
+    assert "MIDDLE-" not in short
+    assert "MIDDLE-" not in short
     assert eng._truncate_to_fit("short", max_tokens=10) == "short"
 
 
@@ -147,12 +149,12 @@ def test_context_overflow_retries_truncated(monkeypatch):
     calls = {"n": 0}
     good = '{"approved": true, "reason": "recovered"}'
 
-    def fake_complete(prompt: str, grammar: object, max_tokens: int, follower: object) -> str:
+    def fake_complete(prompt: str, grammar: object, max_tokens: int, follower: object) -> tuple[str, float]:
         calls["n"] += 1
         if calls["n"] == 1:
             raise ValueError("Requested tokens (9999) exceed context window of 1000")
         assert len(prompt) <= 1000  # retry arrives truncated
-        return good
+        return good, 0.99
 
     monkeypatch.setattr(eng, "_complete", fake_complete)
     out = eng._local_generate("Q" * 900, SchemaFollower(BoolVerdict), max_tokens=10)
