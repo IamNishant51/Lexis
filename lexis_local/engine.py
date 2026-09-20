@@ -797,7 +797,10 @@ class StructuredEngine(Generic[T]):
             self.use_python_mask = _env_flag("LEXIS_USE_PYTHON_MASK", True)
         self.verbose = verbose
         self._llm: Any = None
-        self._lock = threading.Lock()
+        # RLock (not Lock): generate() serializes local decodes through it
+        # while _local_generate() re-enters via load() on the same thread.
+        # llama-cpp-python instances are not safe for concurrent use.
+        self._lock = threading.RLock()
         self._mock = not self.model_path.exists()
         self._vocab_tokens: list[str] | None = None
         self._grammar_backend: str = "none"
@@ -910,8 +913,14 @@ class StructuredEngine(Generic[T]):
 
     def _local_generate(self, prompt: str, follower: SchemaFollower, max_tokens: int) -> str:
         self.load()
-        if self._llm is None:  # pragma: no cover - load() degrades to mock instead
-            raise StructuredGenerationError("local backend unavailable and mock disabled")
+        if self._llm is None:
+            # load() degraded to mock (file exists but unloadable: OOM,
+            # corrupt weights, missing wheel). Serve mock synthesis rather
+            # than a 500 — the API contract is valid JSON, always.
+            log.warning("local backend unavailable; serving mock synthesis")
+            self.last_backend = "local+fallback"
+            self.last_repair_used = True
+            return synthesize_conformant_json(follower.model)
         grammar, backend = build_grammar(follower.model)
         self.last_grammar = backend
         chat_prompt = build_chatml_prompt(prompt)
@@ -950,18 +959,22 @@ class StructuredEngine(Generic[T]):
             self.last_backend = "mock"
             self.last_grammar = "none"
         else:
-            try:
-                text = self._local_generate(prompt, follower, max_tokens)
-                self.last_backend = "local"
-            except StructuredGenerationError:
-                raise
-            except Exception as e:
-                # Local inference failed mid-stream (OOM, bad file): deterministic
-                # schema-derived repair so callers never see corrupt structure.
-                log.warning("local inference failed (%s); deterministic repair", e)
-                text = synthesize_conformant_json(response_model)
-                self.last_backend = "local+fallback"
-                self.last_repair_used = True
+            # Serialized: one live decode at a time per engine (llama-cpp
+            # instances race under concurrent create_completion calls from
+            # the server threadpool or generate_parallel workers).
+            with self._lock:
+                try:
+                    text = self._local_generate(prompt, follower, max_tokens)
+                    self.last_backend = "local"
+                except StructuredGenerationError:
+                    raise
+                except Exception as e:
+                    # Local inference failed mid-stream (OOM, bad file): deterministic
+                    # schema-derived repair so callers never see corrupt structure.
+                    log.warning("local inference failed (%s); deterministic repair", e)
+                    text = synthesize_conformant_json(response_model)
+                    self.last_backend = "local+fallback"
+                    self.last_repair_used = True
         t1 = time.perf_counter()
         obj = follower.parse(text)
         t2 = time.perf_counter()
@@ -982,8 +995,9 @@ class StructuredEngine(Generic[T]):
     ) -> list[Any]:
         """Evaluate many (prompt, schema) pairs against one loaded model.
 
-        A single forward-pass batch when the backend supports it; concurrent
-        constrained decodes otherwise. Order of results matches input order.
+        A single forward-pass batch when the backend supports it; queued
+        constrained decodes otherwise (one live decode at a time under the
+        engine lock). Order of results matches input order.
         """
         self.load()
         with ThreadPoolExecutor(max_workers=min(max_workers, max(1, len(requests)))) as pool:

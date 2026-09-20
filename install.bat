@@ -107,7 +107,7 @@ echo [Lexis] Running smoke tests...
 if errorlevel 1 echo [Lexis] WARNING: some tests failed; server will still start.
 
 :launch
-echo [Lexis] Launching Lexis on http://localhost:%PORT% ...
+echo [Lexis] Launching Lexis (auto port from %PORT% if busy) ...
 echo [Lexis] Keep this window open. Press Ctrl+C to stop.
-%VPY% -m uvicorn lexis_local.main:app --host 0.0.0.0 --port %PORT%
+%VPY% -c "from lexis_local.main import start_server; start_server()"
 pause

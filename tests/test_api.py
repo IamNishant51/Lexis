@@ -219,3 +219,69 @@ def test_streaming_sse():
     )
     assert r.status_code == 200
     assert "[DONE]" in r.text
+
+
+def test_stream_chunks_are_spec_shaped():
+    r = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lexis-local",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
+    )
+    lines = [ln for ln in r.text.splitlines() if ln.startswith("data: ")]
+    assert lines[-1] == "data: [DONE]"
+    chunks = [json.loads(ln[6:]) for ln in lines[:-1]]
+    assert len(chunks) >= 3  # role + content + stop
+    assert chunks[0]["object"] == "chat.completion.chunk"
+    assert chunks[0]["choices"][0]["delta"] == {"role": "assistant"}
+    assert chunks[0]["choices"][0]["finish_reason"] is None
+    assert all(c["model"] == "lexis-local" and "created" in c for c in chunks)
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+    joined = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+    plain = client.post(
+        "/v1/chat/completions",
+        json={"model": "lexis-local", "messages": [{"role": "user", "content": "hi"}]},
+    ).json()["choices"][0]["message"]["content"]
+    assert joined == plain  # stream reassembles to the non-stream body
+
+
+def test_max_tokens_cap_clamps_absurd_requests():
+    r = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "lexis-local",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1000000,
+        },
+    )
+    assert r.status_code == 200
+    json.loads(r.json()["choices"][0]["message"]["content"])  # still valid JSON
+
+
+def test_pick_port_skips_busy_port():
+    import socket
+
+    from lexis_local.main import _pick_port
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
+        held.bind(("0.0.0.0", 0))  # noqa: S104 -- ephemeral test port, same wildcard the picker probes
+        busy = held.getsockname()[1]
+        picked = _pick_port(busy, tries=5)
+        assert picked != busy and picked > busy
+
+
+def test_concurrent_chat_requests_all_succeed():
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(i: int) -> int:
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "lexis-local", "messages": [{"role": "user", "content": f"hi {i}"}]},
+        )
+        assert r.status_code == 200
+        return r.status_code
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        assert list(pool.map(one, range(8))) == [200] * 8

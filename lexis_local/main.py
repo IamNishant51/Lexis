@@ -31,6 +31,10 @@ from lexis_local.wrapper import guard
 
 APP_VERSION = "0.2.0"
 
+# Server-side ceiling: a client requesting absurd max_tokens (intentionally or
+# by default-sprawl) must not OOM the local backend or stall the event loop.
+MAX_TOKENS_CAP = 2048
+
 app = FastAPI(
     title="Lexis",
     version=APP_VERSION,
@@ -221,6 +225,7 @@ def list_models() -> dict[str, Any]:
 def chat_completions(req: ChatCompletionRequest, authorization: str | None = Header(default=None)):
     eng = get_engine()
     t0 = time.perf_counter()
+    max_tokens = min(max(1, req.max_tokens), MAX_TOKENS_CAP)
 
     # Parallel ingestion: N (prompt, schema) pairs, one batched call.
     if req.lexis_parallel:
@@ -229,7 +234,7 @@ def chat_completions(req: ChatCompletionRequest, authorization: str | None = Hea
             sch = item.get("schema", {"type": "object", "properties": {"text": {"type": "string"}}})
             pairs.append((item.get("prompt", ""), _model_from_json_schema("LexisParallel", sch)))
         try:
-            results = eng.generate_parallel(pairs, max_tokens=req.max_tokens)
+            results = eng.generate_parallel(pairs, max_tokens=max_tokens)
         except StructuredGenerationError as e:
             raise HTTPException(status_code=500, detail=str(e)) from e
         docs = [r.model_dump() for r in results]
@@ -243,7 +248,7 @@ def chat_completions(req: ChatCompletionRequest, authorization: str | None = Hea
     target = _target_model(req)
     prompt = _prompt_text(req)
     try:
-        obj = eng.generate(prompt, target, max_tokens=req.max_tokens)
+        obj = eng.generate(prompt, target, max_tokens=max_tokens)
     except StructuredGenerationError as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
     content = obj.model_dump_json()
@@ -252,14 +257,30 @@ def chat_completions(req: ChatCompletionRequest, authorization: str | None = Hea
     if req.stream:
         payload = _openai_envelope(req.model, content, latency_ms=latency, mode=eng.mode)
         chunk_id = payload["id"]
+        created = payload["created"]
+
+        def _chunk(delta: dict[str, Any], finish: str | None) -> str:
+            return (
+                "data: "
+                + json.dumps(
+                    {
+                        "id": chunk_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": req.model,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                    }
+                )
+                + "\n\n"
+            )
 
         def _sse():
-            chunk = {
-                "id": chunk_id,
-                "object": "chat.completion.chunk",
-                "choices": [{"index": 0, "delta": {"content": content}}],
-            }
-            yield f"data: {json.dumps(chunk)}\n\n"
+            # Spec-shaped stream: role first, content in slices (some clients
+            # misbehave on a single giant delta), terminal stop chunk, DONE.
+            yield _chunk({"role": "assistant"}, None)
+            for i in range(0, len(content), 200):
+                yield _chunk({"content": content[i : i + 200]}, None)
+            yield _chunk({}, "stop")
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(
@@ -306,14 +327,49 @@ def guard_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
         return {"valid": False, "errors": str(e)}
 
 
+def _pick_port(preferred: int, tries: int = 10) -> int:
+    """First free TCP port from `preferred` upward (conflict auto-fallback).
+
+    Best-effort probe: the caller binds immediately after, so a losing race is
+    still possible — start_server() retries on bind OSError as backstop.
+    """
+    import socket
+
+    for port in range(preferred, preferred + tries):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("0.0.0.0", port))  # noqa: S104
+                # Probing all interfaces is the point: uvicorn binds 0.0.0.0.
+            except OSError:
+                continue
+            return port
+    raise RuntimeError(f"no free port in {preferred}..{preferred + tries - 1}")
+
+
 def start_server() -> None:
-    """Boot the zero-hallucination FastAPI server (`lexis-local` console entry)."""
+    """Boot the zero-hallucination FastAPI server (`lexis` console entry).
+
+    Honors $PORT; on conflict walks upward to the next free port instead of
+    crashing, and always prints the actual URL it bound.
+    """
     import os
 
     import uvicorn
 
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")  # noqa: S104
+    preferred = int(os.getenv("PORT", "8000"))
+    port = _pick_port(preferred)
+    if port != preferred:
+        print(f"[lexis] port {preferred} busy, using {port}")
+    print(f"[lexis] serving on http://0.0.0.0:{port} (Ctrl+C to stop)")
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")  # noqa: S104
+    except OSError as e:
+        # Lost a bind race after probing: fall through to the next candidate.
+        print(f"[lexis] bind on {port} failed ({e}); retrying")
+        port = _pick_port(port + 1)
+        print(f"[lexis] serving on http://0.0.0.0:{port} (Ctrl+C to stop)")
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")  # noqa: S104
     # 0.0.0.0 is intentional: one-click installers serve LAN coding agents (Aider/Continue).
 
 

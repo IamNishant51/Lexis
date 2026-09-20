@@ -113,5 +113,5 @@ if [ -f "$CACHE_DIR/$MODEL_FILE" ]; then
 else
   say "Backend: MOCK (no model file yet — structured API still fully functional)"
 fi
-say "Launching Lexis on http://localhost:$PORT (Ctrl+C to stop) ..."
-exec $VPY -m uvicorn lexis_local.main:app --host 0.0.0.0 --port "$PORT"
+say "Launching Lexis (auto port from $PORT if busy; Ctrl+C to stop) ..."
+exec $VPY -c "from lexis_local.main import start_server; start_server()"
