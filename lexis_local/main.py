@@ -198,7 +198,7 @@ def _prompt_text(req: ChatCompletionRequest | CompletionRequest) -> str:
             if (m.role == "system" or i == 0) and req.tools:
                 sorted_tools = sorted(req.tools, key=lambda t: t.get("function", {}).get("name", ""))
                 tools_str = "\n".join([json.dumps(t, sort_keys=True) for t in sorted_tools])
-                tools_prompt = f"\n\n# Tools\n\nYou are a tool-using AI. You MUST call one or more functions to assist with the user query.\nCRITICAL: DO NOT WRITE COMMANDS OR CODE TO BE EXECUTED AS PLAIN TEXT! YOU MUST USE THE <tool_call> XML TAGS TO EXECUTE THEM!\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{tools_str}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{{\"name\": <function-name>, \"arguments\": <args-json-object>}}\n</tool_call>\n\nExample:\n<tool_call>\n{{\"name\": \"execute_command\", \"arguments\": {{\"command\": \"ls -la\"}}}}\n</tool_call>"
+                tools_prompt = f"\n\n# Tools\n\nYou are a tool-using AI. You MUST call one or more functions to assist with the user query.\nCRITICAL: DO NOT WRITE COMMANDS OR CODE TO BE EXECUTED AS PLAIN TEXT! YOU MUST USE THE <tool_call> XML TAGS TO EXECUTE THEM!\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{tools_str}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{{\"name\": <function-name>, \"arguments\": <args-json-object>}}\n</tool_call>"
                 c += tools_prompt
                 
             if m.role == "tool":
