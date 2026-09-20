@@ -196,9 +196,29 @@ def _prompt_text(req: ChatCompletionRequest | CompletionRequest) -> str:
                 
             # Format system prompt with tools if present
             if (m.role == "system" or i == 0) and req.tools:
-                sorted_tools = sorted(req.tools, key=lambda t: t.get("function", {}).get("name", ""))
-                tools_str = "\n".join([json.dumps(t, sort_keys=True) for t in sorted_tools])
+                # Prioritize core tools over MCP spam to save context window (3B models degrade rapidly with >15 tools)
+                core_tools = {"bash", "execute_command", "edit", "read", "write", "grep", "glob", "webfetch", "ask_question", "read_file", "write_file", "run_terminal_command"}
+                
+                # Sort tools: core tools first, then alphabetical
+                sorted_tools = sorted(
+                    req.tools, 
+                    key=lambda t: (
+                        0 if t.get("function", {}).get("name", "") in core_tools else 1,
+                        t.get("function", {}).get("name", "")
+                    )
+                )
+                
+                # Truncate tools to a maximum of 15 tools to prevent context overflow (which destroys cache)
+                kept_tools = sorted_tools[:15]
+                tools_str = "\n".join([json.dumps(t, sort_keys=True) for t in kept_tools])
+                
                 tools_prompt = f"\n\n# Tools\n\nYou are a tool-using AI. You MUST call one or more functions to assist with the user query.\nCRITICAL: DO NOT WRITE COMMANDS OR CODE TO BE EXECUTED AS PLAIN TEXT! YOU MUST USE THE <tool_call> XML TAGS TO EXECUTE THEM!\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{tools_str}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{{\"name\": <function-name>, \"arguments\": <args-json-object>}}\n</tool_call>"
+                
+                # Dynamic few-shot example using a real tool to prevent hallucinating tool names (like 'ls')
+                example_name = kept_tools[0]["function"]["name"] if kept_tools else "bash"
+                example_args = '{"command": "ls -la"}' if example_name in {"bash", "execute_command", "run_terminal_command"} else '{"arg": "value"}'
+                tools_prompt += f"\n\nExample:\n<tool_call>\n{{\"name\": \"{example_name}\", \"arguments\": {example_args}}}\n</tool_call>"
+                
                 c += tools_prompt
                 
             if m.role == "tool":
